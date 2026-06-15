@@ -8,10 +8,15 @@ import (
 	"gorm.io/datatypes"
 )
 
-// Shop represents a Shopify store that has installed the VTron app.
+// Shop represents a tenant/store that uses the Vela platform.
+// ShopDomain is the primary Shopify identifier (myshopify.com). 
+// Domain is the custom domain (used in standalone mode).
+// AccessToken is the OAuth token (Shopify mode), empty for standalone.
 type Shop struct {
 	ID            uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
-	Domain        string    `gorm:"uniqueIndex;not null"` // custom domain or subdomain
+	ShopDomain    string    `gorm:"uniqueIndex;not null"` // Shopify domain (myshopify.com)
+	Domain        string    `gorm:"uniqueIndex"`          // custom domain (standalone mode)
+	AccessToken   string    // OAuth access token (Shopify mode), empty for standalone
 	Plan          string    `gorm:"default:free"`
 	Vertical      string    `gorm:"default:''"` // "" / "fashion" / "furniture" / "wine"
 	ContactEmail  string    `gorm:"default:''"` // merchant's email for notifications
@@ -339,7 +344,7 @@ type SyncedOrder struct {
 	LatestEventStatus   string     `gorm:"default:''"`
 	EstimatedDeliveryAt *time.Time
 	OrderCreatedAt      *time.Time `gorm:"index"` // Shopify order creation time (for RFM recency)
-	CreatedAt           time.Time      `gorm:"autoCreateTime`
+	CreatedAt           time.Time      `gorm:"autoCreateTime"`
 	UpdatedAt           time.Time      `gorm:"autoUpdateTime"`
 }
 

@@ -1,0 +1,1469 @@
+// Package server provides the HTTP server setup and lifecycle.
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	chimw "github.com/go-chi/chi/v5/middleware"
+	"github.com/hibiken/asynq"
+	"github.com/google/uuid"
+	"gorm.io/datatypes"
+	"gorm.io/gorm"
+
+	"github.com/JingxuanC/vela-engine/internal/config"
+	"github.com/JingxuanC/vela-engine/internal/database"
+	"github.com/JingxuanC/vela-engine/internal/handler"
+	"github.com/JingxuanC/vela-engine/internal/middleware"
+	"github.com/JingxuanC/vela-engine/internal/model"
+	"github.com/JingxuanC/vela-engine/internal/platform/externaldata"
+	"github.com/JingxuanC/vela-engine/internal/platform/insight"
+	"github.com/JingxuanC/vela-engine/internal/platform/eventbus"
+	"github.com/JingxuanC/vela-engine/internal/platform/notify"
+	"github.com/JingxuanC/vela-engine/internal/platform/observability"
+	ragpkg "github.com/JingxuanC/vela-engine/internal/platform/rag"
+	"github.com/JingxuanC/vela-engine/internal/platform/sync"
+	"github.com/JingxuanC/vela-engine/internal/platform/taskqueue"
+	"github.com/JingxuanC/vela-engine/internal/service"
+	analyticsSvc "github.com/JingxuanC/vela-engine/internal/service/analytics"
+	billingSvc "github.com/JingxuanC/vela-engine/internal/service/billing"
+	"github.com/JingxuanC/vela-engine/internal/service/circuitbreaker"
+	enterpriseSvc "github.com/JingxuanC/vela-engine/internal/service/enterprise"
+	"github.com/JingxuanC/vela-engine/internal/service/meta"
+	multistoreSvc "github.com/JingxuanC/vela-engine/internal/service/multistore"
+	retSvc "github.com/JingxuanC/vela-engine/internal/service/returns"
+	"github.com/JingxuanC/vela-engine/internal/service/judgeme"
+	reviewSvc "github.com/JingxuanC/vela-engine/internal/service/review"
+	salesagent "github.com/JingxuanC/vela-engine/internal/service/salesagent"
+	"github.com/JingxuanC/vela-engine/internal/service/size"
+	shopifySvc "github.com/JingxuanC/vela-engine/internal/service/shopify"
+	socialSvc "github.com/JingxuanC/vela-engine/internal/service/social"
+	"github.com/JingxuanC/vela-engine/internal/service/tryon"
+	"github.com/JingxuanC/vela-engine/internal/service/youtube"
+)
+
+// Server holds all dependencies and the HTTP server instance.
+type Server struct {
+	cfg      *config.Config
+	http     *http.Server
+	cache    *service.CacheService
+	db       *gorm.DB
+	eventBus eventbus.EventBus
+
+	Health         *handler.HealthHandler
+	TryOn          *handler.TryOnHandler
+	Chat           *handler.ChatHandler
+	Review         *handler.ReviewHandler
+	Insights       *handler.InsightsHandler
+	SEO            *handler.SEOHandler
+	Description    *handler.DescriptionHandler
+	Size           *handler.SizeHandler
+	Image          *handler.ImageHandler
+	Returns        *handler.ReturnsHandler
+	Exchange       *handler.ExchangeHandler
+	Recommend      *handler.RecommendHandler
+	Notify         *handler.NotificationsHandler
+	CartRecovery        *handler.CartRecoveryHandler
+	CartRecoveryAttrib  *handler.CartRecoveryAttributor
+	CartRecoveryExec    *handler.CartRecoveryExecutor
+	CartRecoveryAnalytics *handler.CartRecoveryAnalyticsHandler
+	ResendWebhook       *handler.ResendWebhookHandler
+	Usage          *handler.UsageHandler
+	Style          *handler.StyleHandler
+	Webhook        *handler.WebhookHandler
+	Billing        *handler.BillingHandler
+	ReviewReply    *handler.ReviewAutoReplyHandler
+	ReviewSetting  *handler.ReviewAutoReplySettingHandler
+	ReviewAnalytics *handler.ReviewAnalyticsHandler
+	ReviewInvitations *handler.ReviewInvitationsHandler
+	JudgeMe        *handler.JudgeMeHandler
+	JudgeMeWebhook *handler.JudgeMeWebhookHandler
+	Cron           *handler.CronHandler
+	Share          *handler.ShareHandler
+	Contact        *handler.ContactHandler
+	Geo            *handler.GeoHandler
+	Social         *handler.SocialHandler
+	Content        *handler.ContentHandler
+	ContentMetrics *handler.ContentMetricsPuller
+	AdminChat      *handler.AdminChatHandler
+	StorefrontChat     *handler.StorefrontChatHandler
+	SalesAgentSettings *handler.SalesAgentSettingsHandler
+	Customer360        *handler.Customer360Handler
+	RuleEngine     *handler.RuleEngineHandler
+	Enterprise     *handler.EnterpriseHandler
+	Analytics      *handler.AnalyticsHandler
+	ContentAnalytics *handler.ContentAnalyticsHandler
+	MultiStore     *handler.MultiStoreHandler
+	Visibility     *handler.VisibilityHandler
+	LLMConfig      *handler.LLMConfigHandler
+	AISummary      *handler.AISummaryHandler
+	LLMBalance     *handler.LLMBalanceHandler
+	Speech         *handler.SpeechHandler
+	Inbox          *handler.InboxHandler
+	Fulfillment    *handler.FulfillmentHandler
+	Supply         *handler.SupplyHandler
+	Observability  *handler.ObservabilityHandler
+
+	// Marketing Automation
+	CustomerSegments *handler.CustomerSegmentsHandler
+	Marketing        *handler.MarketingHandler
+	CustomerInsights *handler.CustomerInsightsHandler
+
+	// Recommendations
+	Recommendations *handler.RecommendationsHandler
+
+	// Unified Attribution
+	UnifiedAttribution *handler.UnifiedAttributionHandler
+
+	// Marketing engine services
+	rfmEngine         *service.RFMEngine
+	marketingFlowEng  *service.MarketingFlowEngine
+	customerIntelEng  *service.CustomerIntelligenceEngine
+
+	// Recommendation engine
+	recommendationEng *service.RecommendationEngine
+
+	// Review invitation service
+	reviewInviter *service.ReviewInviter
+
+	// Day 4: Platform layer
+	insightEngine      *insight.InsightEngine
+	fulfillmentInsight *insight.FulfillmentInsight
+	trendsClient       *externaldata.GoogleTrendsClient
+	eccompassClient *externaldata.ECCompassClient
+	snapshotStore   *insight.SnapshotStore
+
+	// Phase 1: HA — circuit breaker for external API calls
+	dashscopeCB *circuitbreaker.CircuitBreaker
+
+	// Phase 1.5: Context injection for AI handler enrichment
+	injector *insight.ContextInjector
+
+	// RAG Extension: local embedding + vector search
+	RAG *ragpkg.RAGService
+
+	// Task Queue: async job processing (Asynq)
+	taskClient *taskqueue.AsynqClient
+	taskServer *asynq.Server  // graceful shutdown only
+
+	// Notification center
+	notifyCenter *notify.Center
+
+	// Observability
+	metrics *observability.Collector
+}
+
+// New creates a new Server with all dependencies wired up.
+func New(cfg *config.Config) (*Server, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cache, err := service.NewCacheService(ctx, cfg.RedisURL)
+	if err != nil {
+		return nil, fmt.Errorf("server: init cache: %w", err)
+	}
+
+	// Connect to PostgreSQL (graceful fallback in dev)
+	var db *gorm.DB
+	if cfg.DatabaseURL != "" {
+		db, err = database.Connect(cfg.DatabaseURL)
+		if err != nil {
+			slog.Warn("database connection failed, continuing without DB", "error", err)
+		} else {
+			if err := database.AutoMigrate(db); err != nil {
+				slog.Warn("auto-migration failed", "error", err)
+			} else {
+				slog.Info("database connected and migrated")
+				database.Seed(db)
+			}
+		}
+	} else {
+		slog.Warn("no DATABASE_URL configured, running without database")
+	}
+
+	// Initialize EventBus (Redis Streams)
+	bus := eventbus.NewRedisEventBus(cache.Client())
+	// Register event → GEO cache invalidation
+	bus.Subscribe(eventbus.EventProductSynced, func(ctx context.Context, e *eventbus.Event) error {
+		var p model.SyncedProduct
+		if e.Payload != nil {
+			json.Unmarshal(e.Payload, &p)
+			_ = p
+		}
+		return nil
+	})
+
+	// Register VCI consumer for Auto Reply → customer profile pipeline
+	vci := handler.NewReviewVCIConsumer(db)
+	vci.Start(context.Background(), bus)
+
+	// Initialize observability collector
+	metrics := observability.NewCollector()
+	if db != nil {
+		db.Use(observability.NewGormPlugin(metrics))
+	}
+
+	srv := &Server{cfg: cfg, cache: cache, db: db, eventBus: bus, metrics: metrics}
+
+	// Initialize RAG Extension (non-fatal: degrades to SQL-only if Qdrant/Ollama down)
+	ragSvc, err := ragpkg.NewRAGService(&ragpkg.RAGServiceConfig{
+		QdrantAddr:  cfg.QdrantAddr,
+		OllamaURL:   cfg.OllamaURL,
+		EmbedModel:  cfg.EmbedModel,
+		EmbedDims:   cfg.EmbedDims,
+		RedisClient: cache.Client(),
+		CacheTTLMin: cfg.RAGCacheTTL,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("server: init rag: %w", err)
+	}
+	srv.RAG = ragSvc
+	ragSvc.SetMetricsCollector(metrics)
+
+	// Register RAG EventBus consumers for automatic indexing
+	if ragSvc != nil {
+		bus.Subscribe(eventbus.EventProductSynced, func(ctx context.Context, e *eventbus.Event) error {
+			var payload eventbus.PipelineEventPayload
+			if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.EntityID == "" {
+				return nil
+			}
+			chunks := ragSvc.Chunker().MakeChunks([]ragpkg.ChunkInput{{
+				ShopID:   payload.ShopID,
+				Source:   "product",
+				SourceID: payload.EntityID,
+				Content:  fmt.Sprintf("Product updated: entity_id=%s", payload.EntityID),
+			}})
+			return ragSvc.IndexBatch(ctx, chunks)
+		})
+		bus.Subscribe(eventbus.EventReviewSynced, func(ctx context.Context, e *eventbus.Event) error {
+			var payload eventbus.PipelineEventPayload
+			if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.EntityID == "" {
+				return nil
+			}
+			chunks := ragSvc.Chunker().MakeChunks([]ragpkg.ChunkInput{{
+				ShopID:   payload.ShopID,
+				Source:   "ai_reply",
+				SourceID: payload.EntityID,
+				Content:  fmt.Sprintf("Review synced: entity_id=%s", payload.EntityID),
+			}})
+			return ragSvc.IndexBatch(ctx, chunks)
+		})
+	}
+
+		bus.Subscribe(eventbus.EventReturnSynced, func(ctx context.Context, e *eventbus.Event) error {
+			var payload eventbus.PipelineEventPayload
+			if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.EntityID == "" {
+				return nil
+			}
+			var sr model.SyncedReturn
+			if err := db.WithContext(ctx).
+				Where("platform_id = ? AND shop_id = ?", payload.EntityID, payload.ShopID).
+				First(&sr).Error; err != nil {
+				return nil
+			}
+			var lineItems []model.ReturnLineItemPayload
+			json.Unmarshal(sr.LineItems, &lineItems)
+			for _, li := range lineItems {
+				content := fmt.Sprintf("Return: #%s. Reason: %s. Note: %s. Qty: %d",
+					sr.Name, li.ReturnReason, li.ReturnReasonNote, li.Quantity)
+				chunks := ragSvc.Chunker().MakeChunks([]ragpkg.ChunkInput{{
+					ShopID:   payload.ShopID,
+					Source:   "return",
+					SourceID: fmt.Sprintf("return-%d", li.ID),
+					Content:  content,
+					Meta: ragpkg.ChunkMeta{
+						ReturnID: payload.EntityID,
+						Summary:  fmt.Sprintf("%s: %s", li.ReturnReason, li.ReturnReasonNote),
+					},
+				}})
+				_ = ragSvc.IndexBatch(ctx, chunks)
+			}
+			return nil
+		})
+	// Initialize TaskQueue (Asynq) for async job processing
+	taskClient, err := taskqueue.NewAsynqClient(cfg)
+	if err != nil {
+		slog.Warn("server: task queue client init failed, async tasks disabled", "error", err)
+	} else {
+		srv.taskClient = taskClient
+		// Start Asynq server in background
+		taskSrv := taskqueue.NewServer(cfg)
+		srv.taskServer = taskSrv
+		mux := asynq.NewServeMux()
+		taskqueue.RegisterHandler(mux, taskqueue.TypeCartRecoveryCheck, func(ctx context.Context, t *asynq.Task) error {
+			return srv.handleCartRecoveryCheck(ctx, t)
+		})
+		taskqueue.RegisterHandler(mux, taskqueue.TypeContentPullMetrics, func(ctx context.Context, t *asynq.Task) error {
+			if srv.ContentMetrics == nil {
+				slog.Warn("taskqueue: content metrics puller not configured")
+				return nil
+			}
+			return srv.ContentMetrics.HandleTask(ctx, t.Payload())
+		})
+		taskqueue.RegisterHandler(mux, taskqueue.TypeEnrichProduct, func(ctx context.Context, t *asynq.Task) error {
+			if srv.Webhook == nil {
+				slog.Warn("taskqueue: TypeEnrichProduct skipped — handler not initialized")
+				return nil
+			}
+			return srv.Webhook.HandleEnrichProduct(ctx, t)
+		})
+		taskqueue.RegisterHandler(mux, taskqueue.TypeReviewInvitation, func(ctx context.Context, t *asynq.Task) error {
+			if srv.reviewInviter == nil {
+				slog.Warn("taskqueue: TypeReviewInvitation skipped — handler not initialized")
+				return nil
+			}
+			var payload taskqueue.ReviewInvitationPayload
+			if err := json.Unmarshal(t.Payload(), &payload); err != nil {
+				return fmt.Errorf("unmarshal review invitation payload: %w", err)
+			}
+			return srv.reviewInviter.ExecuteTask(ctx, payload.ReviewInvitationID)
+		})
+		taskqueue.RegisterHandler(mux, taskqueue.TypeCustomerIntelligenceRefresh, func(ctx context.Context, t *asynq.Task) error {
+			if srv.customerIntelEng == nil {
+				slog.Warn("taskqueue: TypeCustomerIntelligenceRefresh skipped — engine not initialized")
+				return nil
+			}
+			var payload taskqueue.CustomerIntelligenceRefreshPayload
+			if err := json.Unmarshal(t.Payload(), &payload); err != nil {
+				return fmt.Errorf("unmarshal customer intelligence refresh payload: %w", err)
+			}
+			shopID, err := uuid.Parse(payload.ShopID)
+			if err != nil {
+				return fmt.Errorf("invalid shop_id in refresh payload: %w", err)
+			}
+			return srv.customerIntelEng.ComputeAll(ctx, shopID)
+		})
+		taskqueue.RegisterHandler(mux, taskqueue.TypeFBTRefresh, func(ctx context.Context, t *asynq.Task) error {
+			if srv.recommendationEng == nil {
+				slog.Warn("taskqueue: TypeFBTRefresh skipped — engine not initialized")
+				return nil
+			}
+			var payload taskqueue.CustomerIntelligenceRefreshPayload
+			if err := json.Unmarshal(t.Payload(), &payload); err != nil {
+				return fmt.Errorf("unmarshal fbt refresh payload: %w", err)
+			}
+			shopID, err := uuid.Parse(payload.ShopID)
+			if err != nil {
+				return fmt.Errorf("invalid shop_id in fbt refresh payload: %w", err)
+			}
+			return srv.recommendationEng.BuildFBT(ctx, shopID)
+		})
+		taskqueue.RegisterHandler(mux, taskqueue.TypeTrendingRefresh, func(ctx context.Context, t *asynq.Task) error {
+			if srv.recommendationEng == nil {
+				slog.Warn("taskqueue: TypeTrendingRefresh skipped — engine not initialized")
+				return nil
+			}
+			var payload taskqueue.CustomerIntelligenceRefreshPayload
+			if err := json.Unmarshal(t.Payload(), &payload); err != nil {
+				return fmt.Errorf("unmarshal trending refresh payload: %w", err)
+			}
+			shopID, err := uuid.Parse(payload.ShopID)
+			if err != nil {
+				return fmt.Errorf("invalid shop_id in trending refresh payload: %w", err)
+			}
+			return srv.recommendationEng.BuildTrending(ctx, shopID)
+		})
+		go func() {
+			if err := taskqueue.Start(taskSrv, mux); err != nil {
+				slog.Error("taskqueue: server failed", "error", err)
+			}
+		}()
+
+		// Start periodic cart recovery check enqueuer (every 5 minutes)
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				ctx := context.Background()
+				if _, err := taskClient.Enqueue(ctx, &taskqueue.Task{
+					Type: taskqueue.TypeCartRecoveryCheck,
+				}); err != nil {
+					slog.Warn("taskqueue: failed to enqueue cart recovery check", "error", err)
+				}
+			}
+		}()
+
+		// Start periodic content metrics puller (every 6 hours)
+		go func() {
+			ticker := time.NewTicker(6 * time.Hour)
+			defer ticker.Stop()
+			for range ticker.C {
+				ctx := context.Background()
+				// Enqueue per-shop pinterest metrics pulls
+				if db != nil {
+					var shops []model.Shop
+					if err := db.WithContext(ctx).Where("uninstalled_at IS NULL").Find(&shops).Error; err == nil {
+						for _, shop := range shops {
+							if _, err := taskClient.Enqueue(ctx, &taskqueue.Task{
+								Type: taskqueue.TypeContentPullMetrics,
+								Payload: taskqueue.ContentPullMetricsPayload{
+									ShopID:   shop.ID.String(),
+									Platform: "pinterest",
+								},
+							}); err != nil {
+								slog.Warn("taskqueue: failed to enqueue content metrics pull",
+									"shop_id", shop.ID, "error", err)
+							}
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	// Initialize customer intelligence refresh (daily at 2:00 AM)
+	go func() {
+		// Calculate initial delay until next 2:00 AM UTC
+		now := time.Now().UTC()
+		next := time.Date(now.Year(), now.Month(), now.Day(), 2, 0, 0, 0, time.UTC)
+		if next.Before(now) {
+			next = next.Add(24 * time.Hour)
+		}
+		initialDelay := next.Sub(now)
+		slog.Info("taskqueue: customer intelligence refresh scheduled",
+			"next_run", next.Format(time.RFC3339),
+			"initial_delay", initialDelay)
+		time.Sleep(initialDelay)
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			ctx := context.Background()
+			if db != nil {
+				var shops []model.Shop
+				if err := db.WithContext(ctx).Where("uninstalled_at IS NULL").Find(&shops).Error; err == nil {
+					for _, shop := range shops {
+						if _, err := taskClient.Enqueue(ctx, &taskqueue.Task{
+							Type: taskqueue.TypeCustomerIntelligenceRefresh,
+							Payload: taskqueue.CustomerIntelligenceRefreshPayload{
+								ShopID: shop.ID.String(),
+							},
+						}); err != nil {
+							slog.Warn("taskqueue: failed to enqueue customer intelligence refresh",
+								"shop_id", shop.ID, "error", err)
+						}
+					}
+					slog.Info("taskqueue: customer intelligence refresh enqueued", "shops", len(shops))
+				}
+			}
+			<-ticker.C
+		}
+	}()
+
+	// Initialize FBT refresh (daily at 3:00 AM UTC)
+	go func() {
+		now := time.Now().UTC()
+		next := time.Date(now.Year(), now.Month(), now.Day(), 3, 0, 0, 0, time.UTC)
+		if next.Before(now) {
+			next = next.Add(24 * time.Hour)
+		}
+		initialDelay := next.Sub(now)
+		slog.Info("taskqueue: FBT refresh scheduled",
+			"next_run", next.Format(time.RFC3339),
+			"initial_delay", initialDelay)
+		time.Sleep(initialDelay)
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			ctx := context.Background()
+			if db != nil && taskClient != nil {
+				var shops []model.Shop
+				if err := db.WithContext(ctx).Where("uninstalled_at IS NULL").Find(&shops).Error; err == nil {
+					for _, shop := range shops {
+						if _, err := taskClient.Enqueue(ctx, &taskqueue.Task{
+							Type: taskqueue.TypeFBTRefresh,
+							Payload: taskqueue.CustomerIntelligenceRefreshPayload{
+								ShopID: shop.ID.String(),
+							},
+						}); err != nil {
+							slog.Warn("taskqueue: failed to enqueue FBT refresh",
+								"shop_id", shop.ID, "error", err)
+						}
+					}
+					slog.Info("taskqueue: FBT refresh enqueued", "shops", len(shops))
+				}
+			}
+			<-ticker.C
+		}
+	}()
+
+	// Initialize Trending refresh (hourly)
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			ctx := context.Background()
+			if db != nil && taskClient != nil {
+				var shops []model.Shop
+				if err := db.WithContext(ctx).Where("uninstalled_at IS NULL").Find(&shops).Error; err == nil {
+					for _, shop := range shops {
+						if _, err := taskClient.Enqueue(ctx, &taskqueue.Task{
+							Type: taskqueue.TypeTrendingRefresh,
+							Payload: taskqueue.CustomerIntelligenceRefreshPayload{
+								ShopID: shop.ID.String(),
+							},
+						}); err != nil {
+							slog.Warn("taskqueue: failed to enqueue trending refresh",
+								"shop_id", shop.ID, "error", err)
+						}
+					}
+					slog.Info("taskqueue: trending refresh enqueued", "shops", len(shops))
+				}
+			}
+			<-ticker.C
+		}
+	}()
+
+	// Initialize circuit breaker for DashScope external API (5 failures → 30s open)
+	srv.dashscopeCB = circuitbreaker.New(5, 30*time.Second)
+
+	// Initialize services
+	llmRouter := service.NewLLMRouter(db, cache, map[string]string{
+		"dashscope": cfg.AliyunDashscopeAPIKey,
+	})
+	llmRouter.SetMetricsCollector(metrics) // LLM observability
+	outfitClient := tryon.NewAliyunOutfitClient(cfg.AliyunDashscopeAPIKey)
+	shipEngine := retSvc.NewShipEngineClient(cfg.ShipEngineAPIKey)
+	imgProc := tryon.NewImageProcessor()
+	r2Storage := service.NewStorageService(cfg.R2AccountID, cfg.R2AccessKeyID, cfg.R2SecretAccessKey, cfg.R2BucketName, cfg.R2PublicURL)
+	shopifyBilling := billingSvc.NewShopifyClient(cfg)
+
+	// Initialize Day 4: External Data clients with Redis caching
+	srv.trendsClient = externaldata.NewGoogleTrendsClient()
+	srv.trendsClient.SetCache(cache)
+	srv.eccompassClient = externaldata.NewECCompassClient(cfg.ECCompassAPIKey)
+
+	// Initialize Day 4: Insight Engine (with Redis for snapshot caching)
+	srv.insightEngine = insight.NewInsightEngine(db, srv.trendsClient, srv.eccompassClient, cache.Client())
+	srv.insightEngine.SetEventBus(bus)
+	srv.snapshotStore = insight.NewSnapshotStore(db, cache.Client())
+
+	// Subscribe InsightEngine to EventBus for event-driven analysis
+	bus.Subscribe(eventbus.EventProductSynced, srv.insightEngine.OnEvent)
+	bus.Subscribe(eventbus.EventOrderSynced, srv.insightEngine.OnEvent)
+	bus.Subscribe(eventbus.EventReviewSynced, srv.insightEngine.OnEvent)
+	bus.Subscribe(eventbus.EventReturnSynced, srv.insightEngine.OnEvent)
+	bus.Subscribe(eventbus.EventOrderUpdated, srv.insightEngine.OnEvent)
+	bus.Subscribe(eventbus.EventProductUpdated, srv.insightEngine.OnEvent)
+
+	// Notify: real-time return anomaly alerts
+	bus.Subscribe(eventbus.EventReturnSynced, func(ctx context.Context, e *eventbus.Event) error {
+		if srv.notifyCenter == nil || srv.insightEngine == nil { return nil }
+		rate, orders, returns, reasons, _, err := srv.insightEngine.ComputeReturnRate(ctx, e.ShopID.String(), 7)
+		if err != nil || orders < 10 { return nil }
+		if rate > 30 {
+			body := fmt.Sprintf("近7天退货率 %.1f%%（%d/%d）。主要原因：%s。建议检查产品描述和尺码指南。", rate, returns, orders, strings.Join(reasons, "、"))
+			if err := srv.notifyCenter.Send(ctx, &notify.Notification{
+				ShopID: e.ShopID, Type: "return_alert",
+				Title: fmt.Sprintf("退货率异常 %.0f%%", rate), Body: body,
+				Channel: notify.ChannelInApp, Priority: notify.PriorityHigh,
+			}); err != nil {
+				slog.Error("notify: failed to send return alert", "shop_id", e.ShopID, "error", err)
+			}
+		}
+		return nil
+	})
+
+	// Auto Reply Service (EventBus consumer)
+	autoReplySvc := reviewSvc.NewAutoReplyService(db, bus)
+	// Adapter factory: creates platform adapters per shop on demand
+	autoReplySvc.SetAdapterFactory(func(ctx context.Context, platform, shopID string) reviewSvc.ReviewAdapter {
+		if platform == "judgeme" {
+			sid, _ := uuid.Parse(shopID)
+			var setting model.JudgeMeSetting
+			if err := db.WithContext(ctx).Where("shop_id = ? AND is_active = ?", sid, true).First(&setting).Error; err != nil {
+				return nil
+			}
+			return judgeme.NewAdapter(setting.APIToken, setting.ShopDomain)
+		}
+		return nil
+	})
+	_ = autoReplySvc.Start(context.Background())
+
+	// VCI: Sales Agent intent signal consumer — persist to PostgreSQL + Redis re-engagement
+	bus.Subscribe("chat.intent.*", func(ctx context.Context, e *eventbus.Event) error {
+		type sig struct {
+			Type       string                 `json:"type"`
+			ProductID  string                 `json:"product_id,omitempty"`
+			CustomerID string                 `json:"customer_id,omitempty"`
+			SessionID  string                 `json:"session_id,omitempty"`
+			Metadata   map[string]interface{} `json:"metadata,omitempty"`
+		}
+		var s sig
+		if err := json.Unmarshal(e.Payload, &s); err != nil {
+			return nil // skip malformed events
+		}
+		event := model.ChatIntentEvent{
+			ShopID:     e.ShopID,
+			CustomerID: s.CustomerID,
+			SessionID:  s.SessionID,
+			EventType:  s.Type,
+			ProductID:  s.ProductID,
+		}
+		if s.Metadata != nil {
+			// Extract agent reply for quality analysis
+			if reply, ok := s.Metadata["agent_reply"].(string); ok {
+				event.AgentReply = reply
+			}
+			b, _ := json.Marshal(s.Metadata)
+			event.Metadata = datatypes.JSON(b)
+		}
+		if err := db.WithContext(ctx).Create(&event).Error; err != nil {
+			slog.Warn("vci: failed to persist intent event", "type", s.Type, "err", err)
+		}
+
+		// Re-engagement: high intent without purchase → tag customer
+		if s.Type == "intent_high_no_purchase" && cache != nil && s.CustomerID != "" {
+			tagKey := fmt.Sprintf("reengagement:%s:%s", e.ShopID, s.CustomerID)
+			cache.Set(ctx, tagKey, s.ProductID, 30*24*time.Hour) // 30-day TTL
+		}
+
+		// Per-customer session counter
+		if cache != nil && s.CustomerID != "" {
+			cacheKey := fmt.Sprintf("customer_sessions:%s:%s", e.ShopID, s.CustomerID)
+			cache.Incr(ctx, cacheKey)
+		}
+
+		// Phase 2: Upsert customer profile from accumulated signals
+		var customerEmail string
+		if s.Metadata != nil {
+			if email, ok := s.Metadata["customer_email"].(string); ok {
+				customerEmail = email
+			}
+		}
+		if err := salesagent.UpsertCustomerProfile(ctx, db, e.ShopID.String(), s.CustomerID, customerEmail, s.Type, s.SessionID, s.Metadata); err != nil {
+			slog.Warn("vci: failed to upsert customer profile", "customer_id", s.CustomerID, "err", err)
+		}
+
+		// Phase 2: Upsert product chat insights
+		if s.ProductID != "" {
+			if err := salesagent.UpsertProductInsight(ctx, db, e.ShopID.String(), s.ProductID, s.Type); err != nil {
+				slog.Warn("vci: failed to upsert product insight", "product_id", s.ProductID, "err", err)
+			}
+		}
+
+		return nil
+	})
+
+	// Auto exchange recommendation: consume return events to generate suggestions
+	srv.Exchange = handler.NewExchangeHandler(db, llmRouter)
+	bus.Subscribe(eventbus.EventReturnSynced, func(ctx context.Context, e *eventbus.Event) error {
+		var payload eventbus.PipelineEventPayload
+		if err := json.Unmarshal(e.Payload, &payload); err != nil || payload.EntityID == "" {
+			return nil
+		}
+		var sr model.SyncedReturn
+		if err := db.WithContext(ctx).Where("platform_id = ? AND shop_id = ?", payload.EntityID, payload.ShopID).First(&sr).Error; err != nil {
+			return nil
+		}
+		var lineItems []model.ReturnLineItemPayload
+		json.Unmarshal(sr.LineItems, &lineItems)
+		for _, li := range lineItems {
+			pid := fmt.Sprintf("%d", li.LineItemID)
+			if pid == "0" { continue }
+			recs := srv.Exchange.RecommendForReturn(ctx, payload.ShopID, pid, "", "", 0, li.ReturnReason)
+			if len(recs) > 0 {
+				ids := make([]string, len(recs))
+				reasons := make([]string, len(recs))
+				for i, r := range recs {
+					ids[i] = r.ProductID
+					reasons[i] = fmt.Sprintf("%s (score:%.0f%%)", r.Title, r.MatchScore*100)
+				}
+				idsJSON, _ := json.Marshal(ids)
+				db.WithContext(ctx).Create(&model.ExchangeAIRecommendation{
+					ShopID:                e.ShopID,
+					ReturnID:              e.ID,
+					OriginalProductID:     pid,
+					RecommendedProductIDs: datatypes.JSON(idsJSON),
+					Reasoning:             strings.Join(reasons, "; "),
+					ConfidenceScore:       recs[0].MatchScore,
+				})
+			}
+			slog.Info("exchange: auto-recommendation", "return", sr.Name, "product", pid, "suggestions", len(recs))
+		}
+		return nil
+	})
+
+	// Phase 1.5: Initialize context injector and register data fetchers
+	srv.injector = insight.NewContextInjector()
+	srv.injector.Register(&insight.ReturnFetcher{})
+	srv.injector.Register(&insight.OrderStatusFetcher{})
+	srv.injector.Register(&insight.ProductDataFetcher{})
+	srv.injector.Register(&insight.InventoryVelocityFetcher{})
+	srv.injector.Register(&insight.TryOnHistoryFetcher{})
+	// Phase 3: Snapshot provides cached aggregated data (1 Redis read vs 6 PG queries)
+	srv.injector.Register(&insight.SnapshopFetcher{Store: srv.snapshotStore})
+	srv.injector.Register(&ragpkg.RAGFetcher{RAG: ragSvc})
+	if srv.trendsClient != nil {
+		srv.injector.Register(&insight.TrendDataFetcher{
+			TrendsClient: srv.trendsClient,
+		})
+	}
+
+	// Initialize handlers
+	srv.Health = handler.NewHealthHandler(cache, db, srv.metrics)
+	srv.TryOn = handler.NewTryOnHandler(cache, outfitClient, imgProc, r2Storage, cfg, db, srv.injector)
+	srv.Chat = handler.NewChatHandler(llmRouter, db, srv.injector)
+	srv.Review = handler.NewReviewHandler(llmRouter)
+	srv.Insights = handler.NewInsightsHandler(db, llmRouter)
+	srv.SEO = handler.NewSEOHandler(llmRouter, cache)
+	srv.Description = handler.NewDescriptionHandler(llmRouter)
+	srv.Size = handler.NewSizeHandler(size.NewSizeRecommendationEngine(nil), db, srv.injector)
+	srv.Image = handler.NewImageHandler(db, llmRouter, outfitClient)
+	srv.Returns = handler.NewReturnsHandler(db, shipEngine, srv.injector)
+	emailClient := service.NewResendClient(cfg.ResendAPIKey, cfg.ResendFromEmail, cfg.ResendToEmail)
+
+	// Initialize RFM Engine
+	rfmEngine := service.NewRFMEngine(db)
+
+	// Initialize Marketing Flow Engine
+	marketingFlowEng := service.NewMarketingFlowEngine(db, emailClient, rfmEngine, bus)
+
+	// Register EventBus consumers for marketing automation
+	if bus != nil {
+		marketingFlowEng.StartEventBusConsumers(context.Background(), bus)
+	}
+
+	// Seed marketing flow templates for all active shops
+	go func() {
+		ctx := context.Background()
+		if srv.db == nil {
+			slog.Warn("marketing: skip template seeding, no database")
+			return
+		}
+		var shops []model.Shop
+		if err := srv.db.WithContext(ctx).Where("uninstalled_at IS NULL").Find(&shops).Error; err == nil {
+			for _, shop := range shops {
+				marketingFlowEng.SeedTemplates(ctx, shop.ID, shop.ShopDomain)
+			}
+			slog.Info("marketing: templates seeded", "shops", len(shops))
+		}
+	}()
+
+	// Start periodic dormant customer scanner (every 24 hours)
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		// Run once at startup
+		time.Sleep(30 * time.Second) // Wait for everything to stabilize
+		if srv.db == nil {
+			slog.Warn("marketing: skip dormant customer scan, no database")
+			return
+		}
+		if err := marketingFlowEng.ScanDormantCustomers(context.Background()); err != nil {
+			slog.Warn("marketing: initial dormant scan failed", "error", err)
+		}
+		for range ticker.C {
+			if err := marketingFlowEng.ScanDormantCustomers(context.Background()); err != nil {
+				slog.Warn("marketing: dormant scan failed", "error", err)
+			}
+		}
+	}()
+
+	srv.Share = handler.NewShareHandler(db, cfg)
+	srv.Contact = handler.NewContactHandler(db, emailClient)
+
+	// Initialize notification center
+	notifyCenter := notify.NewCenter(db)
+	if db != nil {
+		notifyCenter.Register(notify.ChannelInApp, notify.NewInAppNotifier(db))
+	}
+	if emailClient != nil {
+		notifyCenter.Register(notify.ChannelEmail, notify.NewEmailNotifier(emailClient, db))
+	}
+
+	srv.notifyCenter = notifyCenter
+
+	// Initialize ReviewInviter service for review generation
+	srv.reviewInviter = service.NewReviewInviter(db, emailClient, notifyCenter)
+	srv.reviewInviter.SetTaskClient(srv.taskClient)
+	srv.reviewInviter.SetEventBus(bus)
+
+	// Subscribe ReviewInviter to EventOrderFulfilled
+	bus.Subscribe(eventbus.EventOrderFulfilled, srv.reviewInviter.HandleEvent)
+
+	// Review invitation attribution: match incoming reviews against invitations
+	reviewAttributor := service.NewReviewInvitationAttributor(db, bus)
+	if err := reviewAttributor.Start(context.Background(), bus); err != nil {
+		slog.Warn("review_attributor: failed to start", "error", err)
+	}
+
+	// Review revenue attribution: match orders against review invitations
+	reviewRevenueAttr := service.NewReviewRevenueAttributor(db, bus)
+	if err := reviewRevenueAttr.Start(context.Background(), bus); err != nil {
+		slog.Warn("review_revenue_attributor: failed to start", "error", err)
+	}
+
+	// FulfillmentNotifier: EventBus consumer → email + InApp for fulfillment status changes
+	fulfillmentNotifier := service.NewFulfillmentNotifier(db, bus, emailClient, notifyCenter)
+	_ = fulfillmentNotifier.Start(context.Background())
+
+		// Subscribe NotifyCenter to AI-generated insights for real-time merchant alerts
+		bus.Subscribe(eventbus.EventInsightGenerated, func(ctx context.Context, e *eventbus.Event) error {
+			if notifyCenter == nil {
+				return nil
+			}
+			return notifyCenter.Send(ctx, &notify.Notification{
+				ShopID: e.ShopID, Type: "insight", Channel: notify.ChannelInApp,
+				Priority: notify.PriorityNormal,
+				Title: "New AI Insight",
+				Body: fmt.Sprintf("AI analyzed your store data: %s. Check Insights Dashboard.", e.Type),
+			})
+		})
+	// LLM health monitor — startup check + periodic balance polling
+	llmHealth := service.NewLLMHealthMonitor(llmRouter, db, notifyCenter)
+	if err := llmHealth.StartupCheck(context.Background()); err != nil {
+		slog.Warn("llm_health: startup check warning", "error", err)
+	}
+	llmHealth.StartPeriodicBalanceCheck(1 * time.Hour)
+	srv.LLMBalance = handler.NewLLMBalanceHandler(llmHealth)
+	srv.Speech = handler.NewSpeechHandler(llmRouter)
+
+	srv.Geo = handler.NewGeoHandler(db, cache)
+	pinterestClient := socialSvc.NewPinterestClient(cfg.PinterestClientID, cfg.PinterestClientSecret, cfg.PinterestRedirectURI)
+	ytClient := youtube.NewClient(cfg.YouTubeClientID, cfg.YouTubeClientSecret, cfg.YouTubeRedirectURI, cfg.YouTubeAPIKey)
+	metaClient := meta.NewClient(cfg.MetaAppID, cfg.MetaAppSecret, cfg.MetaRedirectURI)
+	var cryptoSvc *service.CryptoService
+	if cfg.CryptoKey != "" {
+		var err error
+		cryptoSvc, err = service.NewCryptoService(cfg.CryptoKey)
+		if err != nil {
+			cryptoSvc = nil; slog.Error("crypto service init failed, social features disabled", "error", err)
+		}
+	}
+	srv.Social = handler.NewSocialHandler(db, cache, cryptoSvc, pinterestClient, metaClient, ytClient)
+	srv.Content = handler.NewContentHandler(db, llmRouter, srv.injector)
+	srv.ContentMetrics = handler.NewContentMetricsPuller(db, cryptoSvc, srv.Social)
+	srv.AdminChat = handler.NewAdminChatHandler(db, llmRouter, srv.injector)
+	salesAgent := salesagent.NewSalesAgent(db, cache, llmRouter)
+	salesAgent.SetEventBus(bus)
+	srv.StorefrontChat = handler.NewStorefrontChatHandler(db, llmRouter, srv.injector, salesAgent)
+	srv.SalesAgentSettings = handler.NewSalesAgentSettingsHandler(db)
+	srv.Inbox = handler.NewInboxHandler(db)
+
+	// Wire up event bus for AI interaction event publishing
+	srv.Chat.SetEventBus(bus)
+	srv.Content.SetEventBus(bus)
+	srv.Size.SetEventBus(bus)
+	srv.TryOn.SetEventBus(bus)
+	srv.Customer360 = handler.NewCustomer360Handler(db)
+	srv.RuleEngine = handler.NewRuleEngineHandler(db)
+	srv.Enterprise = handler.NewEnterpriseHandler(db, enterpriseSvc.NewKeyManager(db, cfg.EnterpriseAPIRateLimit))
+	srv.Analytics = handler.NewAnalyticsHandler(db, analyticsSvc.NewAttributionEngine(db), analyticsSvc.NewPredictiveModel(db), srv.snapshotStore)
+	srv.ContentAnalytics = handler.NewContentAnalyticsHandler(db)
+	srv.MultiStore = handler.NewMultiStoreHandler(db, multistoreSvc.NewGroupManager(db))
+	srv.Visibility = handler.NewVisibilityHandler(db, cache, llmRouter)
+	srv.LLMConfig = handler.NewLLMConfigHandler(db, llmRouter)
+	srv.AISummary = handler.NewAISummaryHandler(db)
+	srv.Recommend = handler.NewRecommendHandler(db)
+	srv.Notify = handler.NewNotificationsHandler(db)
+	srv.CartRecovery = handler.NewCartRecoveryHandler(db)
+	srv.CartRecoveryAttrib = handler.NewCartRecoveryAttributor(db, bus)
+	srv.CartRecoveryExec = handler.NewCartRecoveryExecutor(db, service.NewShopifyDiscountClient(), emailClient)
+	srv.CartRecoveryAnalytics = handler.NewCartRecoveryAnalyticsHandler(db)
+	srv.ResendWebhook = handler.NewResendWebhookHandler(db)
+	srv.Usage = handler.NewUsageHandler(cache, db)
+	srv.Style = handler.NewStyleHandler(cache)
+
+	// Phase 3: Content Factory attribution
+	adminClient := shopifySvc.NewAdminClient(cfg.ShopifyAPIVersion)
+	contentAttributor := handler.NewContentAttributor(db, cfg, bus, adminClient)
+	bus.Subscribe(eventbus.EventContentGenerated, contentAttributor.OnContentGenerated)
+	srv.Webhook = handler.NewWebhookHandler(db, cache, cfg, bus, srv.CartRecoveryAttrib, contentAttributor)
+
+	// Inject task client so product enrichment runs via task queue (not bare goroutine).
+	// srv.taskClient may be nil if task queue init failed — the fallback handles it.
+	srv.Webhook.SetTaskClient(srv.taskClient)
+
+	// Fulfillment tracking: Shopify GraphQL → fulfillment_events
+	fulfillmentTracker := service.NewFulfillmentTracker(db, cfg.ShopifyAPIVersion)
+	fulfillmentTracker.SetEventBus(bus) // wire EventBus for status change events
+	srv.Webhook.SetFulfillmentTracker(fulfillmentTracker)
+
+	// GDPR: shop data cleanup
+	shopCleanup := service.NewShopCleanup(db)
+	srv.Webhook.SetShopCleanup(shopCleanup)
+	srv.Fulfillment = handler.NewFulfillmentHandler(db, fulfillmentTracker)
+
+	// Wire fulfillment handler into storefront chat for order tracking queries
+	srv.StorefrontChat.SetFulfillmentHandler(srv.Fulfillment)
+
+	// Supply Insight handler — stock prediction, return anomaly, trend match
+	srv.Supply = handler.NewSupplyHandler(db, srv.trendsClient)
+
+	// Observability handler — Prometheus + Loki proxy for merchant dashboard
+	srv.Observability = handler.NewObservabilityHandler(cfg.PrometheusURL, cfg.LokiURL)
+
+	// Marketing Automation handlers
+	srv.CustomerSegments = handler.NewCustomerSegmentsHandler(rfmEngine)
+	srv.Marketing = handler.NewMarketingHandler(db, marketingFlowEng)
+
+	// Store engine references for later use
+	srv.rfmEngine = rfmEngine
+	srv.marketingFlowEng = marketingFlowEng
+
+	// Customer Intelligence Engine (LTV + churn prediction)
+	srv.customerIntelEng = service.NewCustomerIntelligenceEngine(db, llmRouter)
+	srv.CustomerInsights = handler.NewCustomerInsightsHandler(srv.customerIntelEng, db)
+
+	// Recommendation Engine (FBT + Trending)
+	srv.recommendationEng = service.NewRecommendationEngine(db)
+	srv.Recommendations = handler.NewRecommendationsHandler(db, srv.recommendationEng)
+
+	// Unified Attribution
+	srv.UnifiedAttribution = handler.NewUnifiedAttributionHandler(db, service.NewUnifiedAttributionService(db))
+
+	// FulfillmentInsight: EventBus consumer → stats aggregation + API
+	srv.fulfillmentInsight = insight.NewFulfillmentInsight(db, bus)
+	_ = srv.fulfillmentInsight.Start(context.Background())
+
+	// Wire fulfillment insight into storefront chat for recent updates context
+	srv.StorefrontChat.SetFulfillmentInsight(srv.fulfillmentInsight)
+
+	// Start EventBus consumers — ALL subscriptions must be registered before this
+	go bus.StartConsumers(context.Background())
+
+	// Cron handler for scheduled sync tasks
+	syncClient := sync.NewShopifyRESTClient(cfg.ShopifyAPIVersion)
+	productSyncer := sync.NewProductSyncer(db, syncClient, bus)
+	orderSyncer := sync.NewOrderSyncer(db, syncClient, bus)
+	customerSyncer := sync.NewCustomerSyncer(db, syncClient, bus)
+	srv.Cron = handler.NewCronHandler(db, cache, llmRouter, srv.Webhook, productSyncer, orderSyncer, customerSyncer, bus, srv.insightEngine, srv.trendsClient, srv.eccompassClient)
+	tokenTracker := service.NewTokenTracker(db, cache)
+	srv.Billing = handler.NewBillingHandler(db, cache, shopifyBilling, tokenTracker)
+	srv.ReviewReply = handler.NewReviewAutoReplyHandler(db, cache, autoReplySvc, bus)
+	srv.ReviewSetting = handler.NewReviewAutoReplySettingHandler(db, cache)
+	srv.ReviewAnalytics = handler.NewReviewAnalyticsHandler(db)
+	srv.ReviewInvitations = handler.NewReviewInvitationsHandler(db, srv.reviewInviter)
+	srv.JudgeMe = handler.NewJudgeMeHandler(db, cache, bus)
+	srv.JudgeMeWebhook = handler.NewJudgeMeWebhookHandler(db, cache, bus)
+
+	router := srv.buildRouter()
+
+	srv.http = &http.Server{
+		Addr:         fmt.Sprintf("%s:%d", cfg.APIHost, cfg.APIPort),
+		Handler:      router,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 120 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	return srv, nil
+}
+
+func (s *Server) buildRouter() chi.Router {
+	r := chi.NewRouter()
+	r.Use(chimw.RequestID, chimw.RealIP, middleware.Observability(s.metrics), middleware.Logging(), middleware.CORS(s.cfg), chimw.Recoverer)
+	r.Use(middleware.Gateway(s.cfg, s.cache, func(ctx context.Context, sid string) uuid.UUID {
+		if id, err := database.ResolveShopID(s.db, sid); err == nil {
+			return id
+		}
+		return uuid.Nil
+	}))
+	// Rate limiting — per-shop + per-IP, Redis-backed sliding window
+	r.Use(middleware.RateLimit(s.cache, middleware.DefaultRateLimits()))
+	// Audit logging — records all /api/* actions
+	r.Use(middleware.Audit(s.db))
+	r.Use(middleware.InternalAuth)
+	r.Use(middleware.BodySizeLimit(10 << 20)) // 10MB max request body
+
+	r.Get("/", s.Health.Health)
+	r.Get("/health", s.Health.Health)
+	r.Get("/ready", s.Health.Ready)
+	r.Get("/metrics", s.MetricsHandler)
+
+	r.Route("/api/tryon", func(r chi.Router) {
+		r.Post("/", s.TryOn.Create)
+		r.Post("/upload", s.TryOn.Upload)
+		r.Get("/{taskID}", s.TryOn.GetStatus)
+		r.Get("/{taskID}/stream", s.TryOn.StreamProgress)
+	})
+	r.Route("/api/admin/chat", func(r chi.Router) {
+		r.Get("/summary", s.AdminChat.AskSummary)
+		r.Post("/ask", s.AdminChat.Ask)
+		r.Post("/stream", s.AdminChat.StreamAsk)
+	})
+	r.Route("/api/chat", func(r chi.Router) {
+		r.Post("/ask", s.Chat.Ask)
+		r.Post("/stream", s.Chat.StreamChat)
+		r.Post("/suggest", s.Chat.Suggest)
+		r.Post("/prompt-optimize", s.Chat.PromptOptimize)
+	})
+	r.Route("/api/review", func(r chi.Router) {
+		r.Post("/summarize", s.Review.Summarize)
+		r.Post("/detect-fake", s.Review.DetectFake)
+	})
+	r.Route("/api/insights", func(r chi.Router) {
+		r.Post("/shop", s.Insights.Shop)
+		r.Post("/daily-report", s.Insights.DailyReport)
+		r.Get("/daily", s.Insights.DailyGet)
+		r.Get("/trends", s.Insights.Trends)
+		r.Get("/fulfillment/stats", s.FulfillmentStats)
+	})
+	r.Post("/api/seo/scan", s.SEO.Scan)
+	r.Post("/api/description/generate", s.Description.Generate)
+	r.Route("/api/size", func(r chi.Router) {
+		r.Post("/recommend", s.Size.Recommend)
+		r.Post("/learn-from-returns", s.Size.LearnFromReturns)
+	})
+	r.Post("/api/image/remove-bg", s.Image.RemoveBG)
+
+	r.Route("/api/returns", func(r chi.Router) {
+		r.Post("/", s.Returns.Create)
+		r.Get("/", s.Returns.List)
+		r.Get("/analyze", s.Returns.Analyze)
+		r.Get("/product", s.Returns.ProductDetail)
+			r.Get("/lookup", s.Returns.Lookup)
+		r.Get("/{returnID}", s.Returns.GetStatus)
+		r.Post("/{returnID}/approve", s.Returns.Approve)
+		r.Post("/{returnID}/label", s.Returns.GenerateLabel)
+		r.Post("/{returnID}/refund", s.Returns.Refund)
+		r.Post("/{returnID}/mark-received", s.Returns.MarkReceived)
+		r.Post("/{returnID}/status", s.Returns.UpdateStatus)
+	})
+	r.Route("/api/exchange", func(r chi.Router) {
+		r.Get("/", s.Exchange.List)               // historical recommendations
+		r.Post("/recommend", s.Exchange.Recommend) // on-demand recommendations
+	})
+	r.Post("/api/recommend", s.Recommend.Get)
+	r.Route("/api/recommendations", func(r chi.Router) {
+		r.Get("/fbt", s.Recommendations.FBT)
+		r.Get("/trending", s.Recommendations.Trending)
+		r.Get("/stats", s.Recommendations.Stats)
+	})
+	r.Route("/api/notifications", func(r chi.Router) {
+		r.Get("/preferences", s.Notify.GetPrefs)
+		r.Put("/preferences", s.Notify.UpdatePrefs)
+			r.Post("/preferences", s.Notify.SetPrefs)
+			r.Get("/in-app", s.Notify.ListInApp)
+			r.Put("/in-app/{id}/read", s.Notify.MarkRead)
+		})
+	r.Route("/api/cart-recovery", func(r chi.Router) {
+		r.Get("/campaigns", s.CartRecovery.List)
+		r.Post("/campaigns", s.CartRecovery.Create)
+		r.Get("/campaigns/{id}", s.CartRecovery.Get)
+		r.Put("/campaigns/{id}", s.CartRecovery.Update)
+		r.Delete("/campaigns/{id}", s.CartRecovery.Delete)
+		// Analytics sub-routes
+		r.Get("/analytics/overview", s.CartRecoveryAnalytics.Overview)
+		r.Get("/analytics/funnel", s.CartRecoveryAnalytics.Funnel)
+		r.Get("/analytics/campaigns", s.CartRecoveryAnalytics.CampaignsComparison)
+		r.Get("/analytics/trend", s.CartRecoveryAnalytics.Trend)
+	})
+	r.Get("/api/shop/usage", s.Usage.GetUsage)
+	r.Get("/api/shop/features", s.Usage.GetFeatures)
+
+	// Style configuration endpoints
+	r.Route("/api/style", func(r chi.Router) {
+		r.Get("/product", s.Style.GetProductStyle)
+		r.Post("/product", s.Style.SetProductStyle)
+		r.Delete("/product", s.Style.DeleteProductStyle)
+		r.Post("/products", s.Style.BatchGetProductStyles)
+		r.Get("/store", s.Style.GetStoreStyle)
+		r.Post("/store", s.Style.SetStoreStyle)
+		r.Get("/presets", s.Style.GetStylePresets)
+	})
+
+	// Webhook endpoint — outside /api/ to avoid token auth
+	r.Post("/webhooks/{topic}", s.Webhook.Handle)
+
+	// Missing routes added from frontend-backend audit
+	r.Post("/api/returns/{returnID}/note", s.Returns.UpdateNote)
+	r.Post("/api/shop/uninstall", s.Webhook.ShopUninstall)
+	r.Post("/api/shop/activate-theme", s.Webhook.ActivateTheme)
+	// Shopify Billing — /api/shop/* routes (aliases for billing handlers)
+	r.Post("/api/shop/subscribe", s.Billing.Subscribe)
+	r.Get("/api/shop/billing-status", s.Billing.Current)
+	r.Post("/api/shop/cancel-subscription", s.Billing.Cancel)
+	r.Post("/api/aitools/batch", s.Chat.BatchAI)
+		r.Post("/upload", s.TryOn.Upload)
+	r.Get("/api/tryon/preview", s.TryOn.Preview)
+
+	// Billing routes
+	r.Route("/api/billing", func(r chi.Router) {
+		r.Post("/subscribe", s.Billing.Subscribe)
+		r.Get("/confirm", s.Billing.Confirm)
+		r.Post("/confirm", s.Billing.Confirm)
+		r.Get("/current", s.Billing.Current)
+		r.Post("/cancel", s.Billing.Cancel)
+		r.Post("/change-plan", s.Billing.ChangePlan)
+	})
+
+	// Cron sync endpoints — scheduled tasks for incremental sync / processing
+	r.Route("/api/cron", func(r chi.Router) {
+		r.Post("/sync-orders", s.Cron.SyncOrders)
+		r.Post("/sync-products", s.Cron.SyncProducts)
+		r.Post("/sync-reviews", s.Cron.SyncReviews)
+		r.Post("/sync-customers", s.Cron.SyncCustomers)
+		r.Post("/process-auto-reply", s.Cron.ProcessAutoReply)
+		r.Post("/run-insights", s.Cron.RunInsights) // Day 4: cron-triggered insight analysis
+		r.Post("/refresh-snapshots", s.RefreshShopSnapshots)
+		r.Post("/refresh-visibility", s.Visibility.RefreshLLMs) // Phase 1.6: daily llms.txt refresh
+	})
+	// Review auto-reply routes
+	r.Route("/api/review/replies", func(r chi.Router) {
+		r.Get("/", s.ReviewReply.List)
+		r.Post("/", s.ReviewReply.Generate)
+		r.Put("/{id}", s.ReviewReply.Edit)
+		r.Post("/{id}/approve", s.ReviewReply.Approve)
+		r.Post("/{id}/reject", s.ReviewReply.Reject)
+	})
+
+	// Review auto-reply settings
+	r.Get("/api/review/settings", s.ReviewSetting.Get)
+	r.Put("/api/review/settings", s.ReviewSetting.Update)
+
+	// Review analytics
+	if s.ReviewAnalytics != nil {
+		r.Get("/api/review/analytics/overview", s.ReviewAnalytics.Overview)
+		r.Get("/api/review/analytics/products", s.ReviewAnalytics.Products)
+		r.Get("/api/review/analytics/value", s.ReviewAnalytics.Value)
+	}
+
+	// Review invitations
+	r.Route("/api/reviews/invitations", func(r chi.Router) {
+		r.Get("/", s.ReviewInvitations.List)
+		r.Get("/stats", s.ReviewInvitations.Stats)
+		r.Post("/{id}/resend", s.ReviewInvitations.Resend)
+	})
+
+	// Judge.me integration routes
+	r.Route("/api/integrations/judgeme", func(r chi.Router) {
+		r.Post("/connect", s.JudgeMe.Connect)
+		r.Delete("/disconnect", s.JudgeMe.Disconnect)
+		r.Get("/status", s.JudgeMe.Status)
+		r.Post("/sync", s.JudgeMe.Sync)
+		r.Get("/logs", s.JudgeMe.Logs)
+	})
+
+	// Judge.me webhook endpoint — outside /api/ to avoid token auth
+	r.Post("/webhooks/judgeme/{shop_id}", s.JudgeMeWebhook.Handle)
+
+	// Resend email webhook endpoint — outside /api/ to avoid token auth
+	r.Post("/webhooks/resend/{shop_id}", s.ResendWebhook.Handle)
+
+	// Storefront AI Shopping Assistant (App Proxy)
+	r.Post("/api/chat/stream", s.StorefrontChat.Stream)
+	r.Post("/api/chat/suggest", s.StorefrontChat.Suggest)
+	// App Proxy path (widget default: /apps/proxy/chat/...)
+	r.Post("/apps/proxy/chat/stream", s.StorefrontChat.Stream)
+	r.Post("/apps/proxy/chat/suggest", s.StorefrontChat.Suggest)
+
+	// Sales Agent settings + analytics
+	r.Get("/api/shop/sales-agent/config", s.SalesAgentSettings.GetConfig)
+	r.Put("/api/shop/sales-agent/config", s.SalesAgentSettings.UpdateConfig)
+	r.Get("/api/shop/sales-agent/stats", s.SalesAgentSettings.GetStats)
+
+	// Inbox — merchant-to-customer manual conversation replies
+	r.Route("/api/inbox", func(r chi.Router) {
+		r.Get("/conversations", s.Inbox.ListConversations)
+		r.Get("/conversations/{id}", s.Inbox.GetConversation)
+		r.Post("/conversations/{id}/reply", s.Inbox.Reply)
+		r.Post("/conversations/{id}/resolve", s.Inbox.Resolve)
+	})
+
+	// Fulfillment tracking
+	r.Route("/api/fulfillment", func(r chi.Router) {
+		r.Post("/sync/{order_id}", s.Fulfillment.Sync)
+		r.Post("/poll", s.Fulfillment.Poll)
+		r.Get("/events/{order_id}", s.Fulfillment.GetEvents)
+	})
+
+	// Supply Insight — stock prediction, return anomaly, trend match
+	r.Route("/api/supply", func(r chi.Router) {
+		r.Get("/stock-prediction", s.Supply.StockPrediction)
+		r.Get("/return-anomalies", s.Supply.ReturnAnomalies)
+		r.Get("/trend-match", s.Supply.TrendMatch)
+	})
+
+	// Marketing Automation — RFM segments + flow engine
+	r.Route("/api/customers/segments", func(r chi.Router) {
+		r.Get("/", s.CustomerSegments.GetSegments)
+		r.Get("/{segment}", s.CustomerSegments.GetSegmentCustomers)
+	})
+	// Customer LTV & Churn Insights
+	r.Route("/api/customers/insights", func(r chi.Router) {
+		r.Get("/", s.CustomerInsights.GetInsights)
+		r.Get("/stats", s.CustomerInsights.GetStats)
+		r.Get("/{email}", s.CustomerInsights.GetOneInsight)
+		r.Get("/{email}/explain", s.CustomerInsights.ExplainInsight)
+	})
+	r.Route("/api/marketing/flows", func(r chi.Router) {
+		r.Get("/", s.Marketing.ListFlows)
+		r.Post("/", s.Marketing.CreateFlow)
+		r.Put("/{id}", s.Marketing.UpdateFlow)
+		r.Get("/{id}/runs", s.Marketing.GetFlowRuns)
+	})
+
+	// LLM model settings
+	r.Get("/api/llm/config", s.LLMConfig.GetConfig)
+	r.Put("/api/llm/config", s.LLMConfig.UpdateConfig)
+	r.Get("/api/llm/models", s.LLMConfig.ListModels)
+	r.Get("/api/llm/balance", s.LLMBalance.GetBalance)
+	r.Post("/api/speech/transcribe", s.Speech.Transcribe)
+	r.Post("/api/speech/synthesize", s.Speech.Synthesize)
+
+	// Share routes
+	r.Post("/api/share", s.Share.Create)
+	r.Get("/api/shop/shares", s.Share.List)
+	r.Get("/share/{slug}", s.Share.Get) // public — outside /api/
+
+	// Contact route
+	r.Post("/api/contact", s.Contact.Submit)
+
+	// Phase 2: Social (unified platform OAuth + publishing)
+	r.Route("/api/social", func(r chi.Router) {
+		r.Get("/platforms", s.Social.Platforms)
+		r.Get("/{platform}/auth-url", s.Social.AuthURL)
+		r.Get("/{platform}/callback", s.Social.Callback)
+		r.Get("/{platform}/status", s.Social.Status)
+		r.Post("/{platform}/disconnect", s.Social.Disconnect)
+		r.Post("/{platform}/publish", s.Social.Publish)
+		r.Get("/posts", s.Social.Posts)
+		r.Delete("/posts/{postID}", s.Social.DeletePost)
+	})
+	// Phase 2: Content Factory
+	r.Route("/api/content", func(r chi.Router) {
+		r.Post("/generate", s.Content.Generate)
+		r.Get("/jobs/{jobID}", s.Content.JobStatus)
+		// Phase 5: Content Pieces list with filters
+		r.Get("/pieces", s.ContentAnalytics.ContentPiecesList)
+	})
+	// Phase 2: Customer 360
+	r.Route("/api/customer360", func(r chi.Router) {
+		r.Get("/list", s.Customer360.List)
+		r.Get("/{customerID}", s.Customer360.Get)
+		r.Get("/{customerID}/profile", s.Customer360.GetProfile)
+	})
+	// Phase 2: Rule Engine
+	r.Route("/api/rules", func(r chi.Router) {
+		r.Get("/", s.RuleEngine.List)
+		r.Post("/", s.RuleEngine.Create)
+		r.Put("/{id}", s.RuleEngine.Update)
+		r.Delete("/{id}", s.RuleEngine.Delete)
+	})
+
+	// Phase 3: Enterprise API Keys
+	r.Route("/api/enterprise", func(r chi.Router) {
+		r.Get("/keys", s.Enterprise.ListKeys)
+		r.Post("/keys", s.Enterprise.CreateKey)
+		r.Delete("/keys/{id}", s.Enterprise.RevokeKey)
+	})
+
+	// Phase 3: Analytics
+	r.Route("/api/analytics", func(r chi.Router) {
+		r.Get("/attribution", s.Analytics.GetAttribution)
+		r.Get("/attribution/unified", s.UnifiedAttribution.GetUnified)
+		r.Get("/predictions/churn", s.Analytics.ChurnPredictions)
+		r.Get("/predictions/churn-risks", s.Analytics.ChurnRisks)
+		r.Get("/predictions/ltv", s.Analytics.LTVPredictions)
+		r.Get("/events", s.Analytics.Events)
+		r.Post("/events/track", s.Analytics.Track)
+		r.Get("/dashboard", s.Analytics.Dashboard)
+			r.Get("/ai-summary", s.AISummary.GetSummary)		// Phase 5: Content Factory Dashboard
+		r.Get("/content-performance", s.ContentAnalytics.ContentPerformanceOverview)
+		r.Get("/content/top", s.ContentAnalytics.TopContent)
+		r.Get("/content/platforms", s.ContentAnalytics.PlatformBreakdown)
+		r.Get("/content/{pieceID}/performance", s.ContentAnalytics.ContentPiecePerformance)
+	})
+
+	// Phase 3: Multi-Store
+	r.Route("/api/multi-store", func(r chi.Router) {
+		r.Get("/groups", s.MultiStore.ListGroups)
+		r.Post("/groups", s.MultiStore.CreateGroup)
+		r.Get("/groups/{id}", s.MultiStore.GetGroup)
+		r.Delete("/groups/{id}", s.MultiStore.DeleteGroup)
+		r.Post("/groups/{id}/members", s.MultiStore.AddMember)
+		r.Delete("/groups/{id}/members/{shopID}", s.MultiStore.RemoveMember)
+		r.Post("/switch-context", s.MultiStore.SwitchContext)
+	})
+
+	// GEO endpoints
+	r.Get("/api/geo/feed", s.Geo.Feed)
+	r.Get("/api/geo/schema", s.Geo.GetSchema)
+	r.Get("/api/geo/llms.txt", s.Geo.GetLLMsTxt)
+	r.Get("/api/geo/settings", s.Geo.Settings)
+	r.Put("/api/geo/settings", s.Geo.UpdateSettings)
+	r.Post("/api/geo/regenerate", s.Geo.Regenerate)
+	// Phase 0: Billing record-usage
+	r.Post("/api/billing/record-usage", s.Billing.RecordUsage)
+	// Phase 1: SEO batch
+	r.Post("/api/seo/batch", s.SEO.BatchCreate)
+	r.Get("/api/seo/batch/{batchID}", s.SEO.BatchStatus)
+	r.Get("/api/seo/batch/{batchID}/results", s.SEO.BatchResults)
+	// Phase 1.6: AI Visibility Suite (2.5 层 — 独立产品)
+	r.Route("/api/visibility", func(r chi.Router) {
+		r.Get("/score", s.Visibility.Score)
+		r.Get("/product", s.Visibility.ProductScore)
+		r.Get("/product-advice", s.Visibility.ProductAdvice)
+		r.Get("/llmstxt", s.Visibility.GetLLMsTxt)
+		r.Post("/llmstxt", s.Visibility.GenerateLLMsTxt)
+		r.Post("/optimize", s.Visibility.OptimizeDescription)
+		r.Post("/fix", s.Visibility.Fix)
+		r.Post("/scan", s.Visibility.Scan)
+	})
+	// Phase 1: Analytics
+	r.Get("/api/shop/funnel", s.Usage.GetFunnel)
+	r.Get("/api/shop/products", s.Usage.GetProducts)
+		// Internal: returns real Shopify access token for local dev AUTH_BYPASS
+		r.Get("/api/shop/internal/debug-token", s.Usage.DebugToken)
+		// Proxy: fetches products from Shopify REST API (bypasses OAuth for local dev)
+		r.Get("/api/shop/proxy-products", s.Usage.ProxyProducts)
+		r.Get("/api/shop/vertical", s.Usage.GetVertical)
+		r.Put("/api/shop/vertical", s.Usage.SetVertical)
+
+	// Observability — merchant dashboard (Prometheus + Loki proxy)
+	r.Route("/api/admin/observability", func(r chi.Router) {
+		r.Get("/summary", s.Observability.Summary)
+		r.Get("/logs", s.Observability.Logs)
+	})
+
+	return r
+}
+
+func (s *Server) Serve() error {
+	go func() {
+		slog.Info("server starting", "addr", s.http.Addr, "env", s.cfg.GoEnv)
+		if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("server error", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	slog.Info("server shutting down...")
+	return s.Shutdown(context.Background())
+}
+
+// FulfillmentStats handles GET /api/insights/fulfillment/stats
+func (s *Server) FulfillmentStats(w http.ResponseWriter, r *http.Request) {
+	if s.fulfillmentInsight == nil {
+		http.Error(w, `{"error":"fulfillment insight not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	shopIDStr := middleware.ShopIDFromContext(r.Context())
+	if shopIDStr == "" {
+		http.Error(w, `{"error":"shop_id is required"}`, http.StatusBadRequest)
+		return
+	}
+	shopID, err := uuid.Parse(shopIDStr)
+	if err != nil {
+		http.Error(w, `{"error":"invalid shop_id"}`, http.StatusBadRequest)
+		return
+	}
+
+	stats, err := s.fulfillmentInsight.ComputeFulfillmentStats(r.Context(), shopID, 30)
+	if err != nil {
+		slog.Error("fulfillment stats: compute failed", "shop_id", shopID, "error", err)
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"stats":   stats,
+	})
+}
+
+// RefreshShopSnapshots regenerates per-shop aggregated data snapshots for all active shops.
+func (s *Server) RefreshShopSnapshots(w http.ResponseWriter, r *http.Request) {
+	if s.snapshotStore == nil {
+		http.Error(w, `{"error":"snapshot store not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	count, err := s.snapshotStore.RefreshAllSnapshots(r.Context())
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(fmt.Sprintf(`{"success":true,"shops_refreshed":%d}`, count)))
+}
+
+// handleCartRecoveryCheck processes a cart_recovery:check task by running the
+// CartRecoveryExecutor against all active shops.
+func (s *Server) handleCartRecoveryCheck(ctx context.Context, t *asynq.Task) error {
+	slog.Info("taskqueue: processing cart recovery check", "task_id", t.ResultWriter().TaskID())
+
+	if s.CartRecoveryExec == nil {
+		slog.Warn("taskqueue: cart recovery executor not configured")
+		return nil
+	}
+
+	// If a specific shop_id is provided in the payload, process only that shop
+	var payload taskqueue.CartRecoveryCheckPayload
+	if err := json.Unmarshal(t.Payload(), &payload); err == nil && payload.ShopID != "" {
+		shopID, err := uuid.Parse(payload.ShopID)
+		if err != nil {
+			return fmt.Errorf("cart_recovery: invalid shop_id in payload: %w", err)
+		}
+		return s.CartRecoveryExec.ProcessAbandonedCheckouts(ctx, shopID)
+	}
+
+	// Otherwise, iterate all active shops
+	if s.db == nil {
+		return nil
+	}
+	var shops []model.Shop
+	if err := s.db.WithContext(ctx).Where("uninstalled_at IS NULL").Find(&shops).Error; err != nil {
+		return fmt.Errorf("cart_recovery: query shops: %w", err)
+	}
+	for _, shop := range shops {
+		if err := s.CartRecoveryExec.ProcessAbandonedCheckouts(ctx, shop.ID); err != nil {
+			slog.Error("taskqueue: cart recovery check failed for shop",
+				"shop_id", shop.ID, "error", err)
+			// Continue to next shop on error
+		}
+	}
+	return nil
+}
+
+func (s *Server) Shutdown(ctx context.Context) error {
+	sCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	if err := s.http.Shutdown(sCtx); err != nil {
+		slog.Error("http server shutdown error", "error", err)
+	}
+
+	if s.eventBus != nil {
+		s.eventBus.Close()
+	}
+	if s.taskServer != nil {
+		taskqueue.Shutdown(s.taskServer, sCtx)
+	}
+	if s.cache != nil {
+		s.cache.Close()
+	}
+	if s.db != nil {
+		if sqlDB, err := s.db.DB(); err == nil {
+			sqlDB.Close()
+		}
+	}
+
+	slog.Info("server stopped")
+	return nil
+}
+
+func (s *Server) Cache() *service.CacheService { return s.cache }
+func (s *Server) Config() *config.Config       { return s.cfg }
+func (s *Server) DB() *gorm.DB { return s.db }
+
+// MetricsHandler serves Prometheus-format metrics.
+func (s *Server) MetricsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	w.Write([]byte(s.metrics.Prometheus()))
+}

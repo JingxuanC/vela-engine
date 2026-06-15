@@ -1,0 +1,16 @@
+services:
+  vela-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8000"
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgres://vela:***@postgres:5432/vela?sslmode=disable}
+    networks:
+      - default
+
+networks:
+  default:
+    external: true
+    name: shopify-saas_default

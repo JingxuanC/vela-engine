@@ -1,91 +1,108 @@
-// Vela Engine — standalone AI analytics server.
-// Runs independently of Shopify. Connects to PostgreSQL, registers core API routes.
+// Vela Engine — AI analytics server. Full-featured entry point.
 package main
 
 import (
+	"bufio"
+	"flag"
+	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
+	"path/filepath"
+	"strings"
 
-	"github.com/go-chi/chi/v5"
-	chiMiddleware "github.com/go-chi/chi/v5/middleware"
-
-	"github.com/JingxuanC/vela-engine/internal/database"
-	"github.com/JingxuanC/vela-engine/internal/handler"
-	"github.com/JingxuanC/vela-engine/internal/service"
+	"github.com/JingxuanC/vela-engine/internal/config"
+	"github.com/JingxuanC/vela-engine/internal/server"
 )
 
-func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-
-	// ── Database ──────────────────────────────────────────────
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		dbURL = "postgres://vela:***@localhost:5432/vela?sslmode=disable"
+// loadDotEnv reads .env files and sets environment variables.
+// Searches: .env (local), ../.env (project root). Does NOT overwrite existing vars.
+func loadDotEnv() {
+	candidates := []string{".env"}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), ".env"))
 	}
 
-	db, err := database.Connect(dbURL)
+	for _, path := range candidates {
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			if os.Getenv(key) == "" {
+				os.Setenv(key, val)
+			}
+		}
+		f.Close()
+	}
+}
+
+func main() {
+	loadDotEnv()
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Vela Engine — AI Analytics Server
+
+Usage:
+  vela-engine [flags]
+
+Flags:
+  --config <path>   Path to YAML config file (default: auto-detect)
+
+Environment:
+  GO_ENV            Environment: development | production (default: development)
+  DATABASE_URL      PostgreSQL connection string
+  REDIS_URL         Redis connection string
+  DASHSCOPE_API_KEY Alibaba DashScope API key
+  DEEPSEEK_API_KEY  DeepSeek API key
+  OPENAI_API_KEY    OpenAI API key
+  API_TOKEN         Service-to-service auth token (required in production)
+  PORT              Server port (default: 8000)
+`)
+	}
+
+	flag.Parse()
+
+	// Setup structured logger
+	logLevel := slog.LevelInfo
+	if os.Getenv("LOG_LEVEL") == "debug" {
+		logLevel = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: logLevel,
+	})))
+
+	// Load configuration
+	cfg, err := config.Load()
 	if err != nil {
-		logger.Error("database connect failed", "error", err)
+		slog.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
 
-	// ── Services ──────────────────────────────────────────────
-	recEngine := service.NewRecommendationEngine(db)
-	attrService := service.NewUnifiedAttributionService(db)
+	slog.Info("configuration loaded",
+		"env", cfg.GoEnv,
+		"log_level", cfg.LogLevel,
+	)
 
-	// ── Handlers ──────────────────────────────────────────────
-	recHandler := handler.NewRecommendationsHandler(db, recEngine)
-	attrHandler := handler.NewUnifiedAttributionHandler(db, attrService)
-
-	// ── Router ────────────────────────────────────────────────
-	r := chi.NewRouter()
-	r.Use(chiMiddleware.RequestID)
-	r.Use(chiMiddleware.RealIP)
-	r.Use(chiMiddleware.Logger)
-	r.Use(chiMiddleware.Recoverer)
-
-	// Health
-	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok","service":"vela-engine"}`))
-	})
-
-	// API
-	r.Route("/api", func(r chi.Router) {
-		r.Route("/recommendations", func(r chi.Router) {
-			r.Get("/fbt", recHandler.FBT)
-			r.Get("/trending", recHandler.Trending)
-			r.Get("/stats", recHandler.Stats)
-		})
-		r.Route("/analytics", func(r chi.Router) {
-			r.Route("/attribution", func(r chi.Router) {
-				r.Get("/unified", attrHandler.GetUnified)
-			})
-		})
-	})
-
-	// ── Start ─────────────────────────────────────────────────
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8000"
+	// Create and start server
+	srv, err := server.New(cfg)
+	if err != nil {
+		slog.Error("failed to create server", "error", err)
+		os.Exit(1)
 	}
 
-	server := &http.Server{Addr: ":" + port, Handler: r}
-
-	go func() {
-		ch := make(chan os.Signal, 1)
-		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-		<-ch
-		logger.Info("shutting down...")
-		server.Close()
-	}()
-
-	logger.Info("vela-engine starting", "port", port)
-	if err := server.ListenAndServe(); err != http.ErrServerClosed {
-		logger.Error("server failed", "error", err)
+	if err := srv.Serve(); err != nil {
+		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}
 }

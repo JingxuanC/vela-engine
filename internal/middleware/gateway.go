@@ -14,12 +14,18 @@ import (
 	"github.com/JingxuanC/vela-engine/pkg/httputil"
 )
 
+// ShopIDResolver resolves a shop_id string to a UUID.
+// Used by the gateway to extract shop context from API requests.
+type ShopIDResolver func(ctx context.Context, shopIDStr string) uuid.UUID
+
 // Gateway returns middleware that enforces API key authentication,
 // feature flag checks, and daily quota limits on /api/ routes.
 //
 // Auth: X-API-Key header (simple token, not Shopify OAuth).
 // Public endpoints (/api/contact, /health) pass through unauthenticated.
-func Gateway(cfg *config.Config, cache *service.CacheService) func(http.Handler) http.Handler {
+//
+// shopIDResolver is optional — pass nil if shop context is not needed.
+func Gateway(cfg *config.Config, cache *service.CacheService, shopIDResolver ShopIDResolver) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Public paths pass through
