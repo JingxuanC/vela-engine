@@ -1,0 +1,58 @@
+# Vela AI — Development Config
+# This file is auto-loaded when GO_ENV=development (default).
+# Secrets should go in env vars, not here. Use this for non-sensitive defaults.
+
+go_env: development
+log_level: debug
+
+api_host: "0.0.0.0"
+api_port: 8000
+
+database_url: "postgres://vela:vela@localhost:5433/vela"
+redis_url: "redis://localhost:6380"
+
+# LLM — defaults to DeepSeek. Set API keys via env vars:
+#   DEEPSEEK_API_KEY     (required for production)
+#   DASHSCOPE_API_KEY    (if using dashscope provider)
+#   OPENAI_API_KEY       (if using openai provider)
+#   LLM_DEFAULT_PROVIDER (default: deepseek)
+#   LLM_DEFAULT_MODEL    (default: deepseek-chat)
+dashscope_endpoint: "https://dashscope.aliyuncs.com"
+
+# RAG
+qdrant_url: "http://localhost:6333"
+ollama_url: "http://localhost:11434"
+rag_embed_model: "nomic-embed-text"
+rag_embed_dims: 768
+rag_default_top_k: 10
+rag_min_score: 0.5
+rag_cache_ttl_min: 30
+
+# Limits
+max_image_size_mb: 5
+task_timeout_seconds: 120
+max_retries: 3
+cache_ttl_hours: 24
+max_concurrent_sse: 500
+
+# R2 (images)
+r2_bucket_name: "vela-images"
+r2_public_url: "https://images.vela.dev"
+
+# Shopify
+shopify_api_version: "2025-01"
+billing_return_url: "http://localhost:8000/api/billing/confirm"
+
+# External data — use demo data in dev
+external_data_mock: true
+
+# Enterprise
+enterprise_api_rate_limit: 300
+attribution_window_days: 30
+
+# Email defaults
+resend_from_email: "contact@vela.dev"
+resend_to_email: "team@vela.dev"
+
+# Asynq
+asynq_redis_db: 1

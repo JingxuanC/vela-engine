@@ -1,0 +1,50 @@
+# Vela AI — Production Config Example
+# Copy to configs/config.production.yaml and fill in real values.
+# Secrets (API keys, tokens) should be set via environment variables, not here.
+
+go_env: production
+log_level: info
+
+api_host: "0.0.0.0"
+api_port: 8000
+
+# Required in production — can also be set via DATABASE_URL env var
+# database_url: "postgres://user:pass@host:5432/vela"
+
+# Required in production — can also be set via REDIS_URL env var
+# redis_url: "redis://user:pass@host:6379"
+
+# LLM (set via env: ALIYUN_DASHSCOPE_API_KEY)
+dashscope_endpoint: "https://dashscope.aliyuncs.com"
+
+# RAG
+qdrant_url: "http://qdrant:6333"
+ollama_url: "http://ollama:11434"
+
+# Limits
+max_image_size_mb: 5
+task_timeout_seconds: 120
+max_retries: 3
+cache_ttl_hours: 24
+max_concurrent_sse: 500
+
+# R2
+r2_bucket_name: "vela-images"
+r2_public_url: "https://images.vela.dev"
+
+# Shopify
+shopify_api_version: "2025-01"
+billing_return_url: "https://api.vela.dev/api/billing/confirm"
+
+# External data
+external_data_mock: false
+
+# Enterprise
+enterprise_api_rate_limit: 300
+attribution_window_days: 30
+
+# Email
+resend_from_email: "contact@vela.dev"
+resend_to_email: "team@vela.dev"
+
+asynq_redis_db: 1
